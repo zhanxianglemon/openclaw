@@ -43,6 +43,8 @@ const requiredPathGroups = [
   "dist/plugin-sdk/copilot-proxy.d.ts",
   "dist/plugin-sdk/device-pair.js",
   "dist/plugin-sdk/device-pair.d.ts",
+  "dist/plugin-sdk/diagnostics-cls.js",
+  "dist/plugin-sdk/diagnostics-cls.d.ts",
   "dist/plugin-sdk/diagnostics-otel.js",
   "dist/plugin-sdk/diagnostics-otel.d.ts",
   "dist/plugin-sdk/diffs.js",

@@ -96,6 +96,10 @@
       "types": "./dist/plugin-sdk/device-pair.d.ts",
       "default": "./dist/plugin-sdk/device-pair.js"
     },
+    "./plugin-sdk/diagnostics-cls": {
+      "types": "./dist/plugin-sdk/diagnostics-cls.d.ts",
+      "default": "./dist/plugin-sdk/diagnostics-cls.js"
+    },
     "./plugin-sdk/diagnostics-otel": {
       "types": "./dist/plugin-sdk/diagnostics-otel.d.ts",
       "default": "./dist/plugin-sdk/diagnostics-otel.js"

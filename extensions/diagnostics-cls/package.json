@@ -1,0 +1,14 @@
+{
+  "name": "@openclaw/diagnostics-cls",
+  "version": "2026.3.2",
+  "description": "OpenClaw diagnostics trace exporter to Tencent Cloud CLS",
+  "type": "module",
+  "dependencies": {
+    "tencentcloud-cls-sdk-nodejs": "^1.0.1"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

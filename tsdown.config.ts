@@ -20,6 +20,7 @@ const pluginSdkEntrypoints = [
   "bluebubbles",
   "copilot-proxy",
   "device-pair",
+  "diagnostics-cls",
   "diagnostics-otel",
   "diffs",
   "feishu",

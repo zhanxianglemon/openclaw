@@ -108,6 +108,11 @@ const pluginSdkScopedAliasEntries = [
   },
   { subpath: "device-pair", srcFile: "device-pair.ts", distFile: "device-pair.js" },
   {
+    subpath: "diagnostics-cls",
+    srcFile: "diagnostics-cls.ts",
+    distFile: "diagnostics-cls.js",
+  },
+  {
     subpath: "diagnostics-otel",
     srcFile: "diagnostics-otel.ts",
     distFile: "diagnostics-otel.js",

@@ -1,0 +1,91 @@
+{
+  "id": "diagnostics-cls",
+  "name": "Diagnostics CLS",
+  "description": "将诊断 trace 事件和运行日志上传到腾讯云日志服务（CLS）",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["topicId", "secretId", "secretKey", "endpoint"],
+    "properties": {
+      "topicId": {
+        "type": "string",
+        "description": "CLS 日志主题 ID"
+      },
+      "secretId": {
+        "type": "string",
+        "description": "腾讯云 SecretId"
+      },
+      "secretKey": {
+        "type": "string",
+        "description": "腾讯云 SecretKey"
+      },
+      "endpoint": {
+        "type": "string",
+        "description": "CLS 接入点，例如 ap-guangzhou.cls.tencentcs.com"
+      },
+      "source": {
+        "type": "string",
+        "description": "日志来源标识，默认为 openclaw"
+      },
+      "enableTraceEvent": {
+        "type": "boolean",
+        "description": "是否上传诊断 trace 事件（model.usage / message.processed 等），默认 true"
+      },
+      "enableLogTransport": {
+        "type": "boolean",
+        "description": "是否同时上传运行日志（info/warn/error 等），默认 true"
+      },
+      "minLevel": {
+        "type": "string",
+        "enum": ["trace", "debug", "info", "warn", "error", "fatal"],
+        "description": "运行日志最低上传级别，默认 info（仅 enableLogTransport=true 时生效）"
+      },
+      "sendTimeThreshold": {
+        "type": "number",
+        "minimum": 1,
+        "description": "异步发送时间阈值（秒），达到后触发上传，默认 2"
+      },
+      "sendCountThreshold": {
+        "type": "number",
+        "minimum": 1,
+        "description": "异步发送条数阈值，达到后触发上传，默认 1000"
+      },
+      "enableAppLog": {
+        "type": "boolean",
+        "description": "是否监听应用运行日志文件（/tmp/openclaw/openclaw-YYYY-MM-DD.log）并上报到 CLS，默认 false"
+      },
+      "enableSessionLog": {
+        "type": "boolean",
+        "description": "是否监听 Session JSONL 文件（~/.openclaw/agents/*/sessions/*.jsonl）并上报到 CLS，默认 false"
+      },
+      "stateDir": {
+        "type": "string",
+        "description": "Session JSONL 文件所在的 state 根目录，默认为 ~/.openclaw，dev 环境可设为 ~/.openclaw-dev"
+      },
+      "appLogTopicId": {
+        "type": "string",
+        "description": "应用运行日志上报的 CLS 主题 ID，不填则使用 topicId（仅 enableAppLog=true 时生效）"
+      },
+      "sessionLogTopicId": {
+        "type": "string",
+        "description": "Session JSONL 日志上报的 CLS 主题 ID，不填则使用 topicId（仅 enableSessionLog=true 时生效）"
+      },
+      "enableMetrics": {
+        "type": "boolean",
+        "description": "是否上报 Metrics 指标事件（webhook.received / message.queued / queue.lane / session.state / run.attempt / diagnostic.heartbeat），默认 true"
+      },
+      "metricsTopicId": {
+        "type": "string",
+        "description": "Metrics 指标上报的 CLS 主题 ID，不填则使用 topicId"
+      },
+      "enableConversationLog": {
+        "type": "boolean",
+        "description": "是否通过 Plugin Hook 实时上报对话内容（llm_input / llm_output），零磁盘 I/O，默认 false"
+      },
+      "conversationLogTopicId": {
+        "type": "string",
+        "description": "对话日志上报的 CLS 主题 ID，不填则使用 topicId（仅 enableConversationLog=true 时生效）"
+      }
+    }
+  }
+}
