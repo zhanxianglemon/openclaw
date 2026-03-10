@@ -47,6 +47,10 @@ interface ClsTraceConfig {
   appLogTopicId: string;
   /** Session 日志上报到的 CLS 主题 ID（不填则使用 topicId） */
   sessionLogTopicId: string;
+  /** Trace 事件上报到的 CLS 主题 ID（不填则使用 topicId） */
+  traceTopicId: string;
+  /** 框架运行日志上报到的 CLS 主题 ID（不填则使用 topicId） */
+  logTopicId: string;
   /** 是否启用 Metrics 指标上报（webhook.received / message.queued / queue / session.state / run.attempt / heartbeat），默认 true */
   enableMetrics: boolean;
   /** Metrics 上报到的 CLS 主题 ID（不填则使用 topicId） */
@@ -111,6 +115,16 @@ function resolveConfig(pluginConfig: Record<string, unknown> | undefined): ClsTr
       ? pluginConfig.sessionLogTopicId.trim()
       : topicId;
 
+  const traceTopicId =
+    typeof pluginConfig?.traceTopicId === "string" && pluginConfig.traceTopicId.trim()
+      ? pluginConfig.traceTopicId.trim()
+      : topicId;
+
+  const logTopicId =
+    typeof pluginConfig?.logTopicId === "string" && pluginConfig.logTopicId.trim()
+      ? pluginConfig.logTopicId.trim()
+      : topicId;
+
   const enableMetrics = pluginConfig?.enableMetrics === false ? false : true;
 
   const metricsTopicId =
@@ -146,6 +160,8 @@ function resolveConfig(pluginConfig: Record<string, unknown> | undefined): ClsTr
     metricsTopicId,
     enableConversationLog,
     conversationLogTopicId,
+    traceTopicId,
+    logTopicId,
   };
 }
 
@@ -826,6 +842,10 @@ export function createDiagnosticsClsTraceService(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let producer: any = null;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let traceProducer: any = null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let logProducer: any = null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let metricsProducer: any = null;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let conversationLogProducer: any = null;
@@ -842,10 +862,10 @@ export function createDiagnosticsClsTraceService(
   const minLevelWeight = cfg ? (LOG_LEVEL_WEIGHT[cfg.minLevel] ?? 0) : 0;
 
   /**
-   * 将 TraceSpan 转换为 CLS LogItem 并通过 producer.send 异步发送
+   * 将 TraceSpan 转换为 CLS LogItem 并通过 traceProducer.send 异步发送
    */
   const sendSpan = (span: TraceSpan): void => {
-    if (!producer || !LogItem || !Content) return;
+    if (!traceProducer || !LogItem || !Content) return;
     try {
       const item = new LogItem();
       item.setTime(Math.floor(Date.now() / 1000));
@@ -868,7 +888,7 @@ export function createDiagnosticsClsTraceService(
         item.pushBack(new Content(k, String(v)));
       }
 
-      producer.send(item).catch((e: unknown) => {
+      traceProducer.send(item).catch((e: unknown) => {
         const msg = e instanceof Error ? e.message : JSON.stringify(e);
         console.warn(`[diagnostics-cls] send 失败: ${msg}`);
       });
@@ -1153,6 +1173,60 @@ export function createDiagnosticsClsTraceService(
         throw err;
       }
 
+      // 初始化 Trace 事件 producer（若 traceTopicId 与主 topicId 不同则创建独立实例）
+      if (cfg.traceTopicId === cfg.topicId) {
+        traceProducer = producer;
+      } else {
+        const ProducerClsTrace = ns.Producer as new (...args: unknown[]) => unknown;
+        traceProducer = new ProducerClsTrace({
+          topic_id: cfg.traceTopicId,
+          endpoint: cfg.endpoint,
+          credential: {
+            secretId: cfg.secretId,
+            secretKey: cfg.secretKey,
+          },
+          time: cfg.sendTimeThreshold,
+          count: cfg.sendCountThreshold,
+          onSendLogsError: (result: unknown) => {
+            if (
+              result !== null &&
+              typeof result === "object" &&
+              (result as Record<string, unknown>).status === 200
+            ) {
+              return;
+            }
+            ctx.logger.warn(`diagnostics-cls: Trace 事件上传失败 - ${JSON.stringify(result)}`);
+          },
+        });
+      }
+
+      // 初始化框架运行日志 producer（若 logTopicId 与主 topicId 不同则创建独立实例）
+      if (cfg.logTopicId === cfg.topicId) {
+        logProducer = producer;
+      } else {
+        const ProducerClsLog = ns.Producer as new (...args: unknown[]) => unknown;
+        logProducer = new ProducerClsLog({
+          topic_id: cfg.logTopicId,
+          endpoint: cfg.endpoint,
+          credential: {
+            secretId: cfg.secretId,
+            secretKey: cfg.secretKey,
+          },
+          time: cfg.sendTimeThreshold,
+          count: cfg.sendCountThreshold,
+          onSendLogsError: (result: unknown) => {
+            if (
+              result !== null &&
+              typeof result === "object" &&
+              (result as Record<string, unknown>).status === 200
+            ) {
+              return;
+            }
+            ctx.logger.warn(`diagnostics-cls: 框架运行日志上传失败 - ${JSON.stringify(result)}`);
+          },
+        });
+      }
+
       // 初始化 Metrics producer（若 metricsTopicId 与主 topicId 不同则创建独立实例）
       if (cfg.enableMetrics) {
         if (cfg.metricsTopicId === cfg.topicId) {
@@ -1270,7 +1344,12 @@ export function createDiagnosticsClsTraceService(
       }
 
       ctx.logger.info(
-        `diagnostics-cls: 启动，CLS endpoint=${cfg.endpoint}，topicId=${cfg.topicId}，enableTraceEvent=${cfg.enableTraceEvent}，enableLogTransport=${cfg.enableLogTransport}，minLevel=${cfg.minLevel}，enableMetrics=${cfg.enableMetrics}，enableAppLog=${cfg.enableAppLog}（实时流）enableSessionLog=${cfg.enableSessionLog}（实时流）`,
+        `diagnostics-cls: 启动，CLS endpoint=${cfg.endpoint}，topicId=${cfg.topicId}，` +
+          `traceTopicId=${cfg.traceTopicId}，logTopicId=${cfg.logTopicId}，` +
+          `metricsTopicId=${cfg.metricsTopicId}，appLogTopicId=${cfg.appLogTopicId}，` +
+          `sessionLogTopicId=${cfg.sessionLogTopicId}，conversationLogTopicId=${cfg.conversationLogTopicId}，` +
+          `enableTraceEvent=${cfg.enableTraceEvent}，enableLogTransport=${cfg.enableLogTransport}，minLevel=${cfg.minLevel}，` +
+          `enableMetrics=${cfg.enableMetrics}，enableAppLog=${cfg.enableAppLog}（实时流）enableSessionLog=${cfg.enableSessionLog}（实时流）`,
       );
 
       // enableAppLog：通过 registerLogTransport 实现实时流（零磁盘 I/O，替代文件 tail）
@@ -1415,7 +1494,7 @@ export function createDiagnosticsClsTraceService(
       // 注册运行日志 transport（可通过 enableLogTransport: false 关闭）
       if (cfg.enableLogTransport) {
         stopTransport = registerLogTransport((logObj) => {
-          if (!producer || !LogItem || !Content) return;
+          if (!logProducer || !LogItem || !Content) return;
           try {
             // transport 失败时记录错误日志（而非静默忽略）
             const parsed = parseLogObj(logObj);
@@ -1460,7 +1539,7 @@ export function createDiagnosticsClsTraceService(
               item.pushBack(new Content(k, v));
             }
 
-            producer.send(item).catch((e: unknown) => {
+            logProducer.send(item).catch((e: unknown) => {
               const msg = e instanceof Error ? e.message : JSON.stringify(e);
               console.warn(`[diagnostics-cls] log send 失败: ${msg}`);
             });
@@ -1482,6 +1561,12 @@ export function createDiagnosticsClsTraceService(
       stopAppLogTransport?.();
       stopAppLogTransport = null;
       // 各 producer 若与主 producer 不同则单独置空（SDK 无 shutdown 接口，依赖 GC）
+      if (traceProducer !== producer) {
+        traceProducer = null;
+      }
+      if (logProducer !== producer) {
+        logProducer = null;
+      }
       if (metricsProducer !== producer) {
         metricsProducer = null;
       }
@@ -1495,6 +1580,8 @@ export function createDiagnosticsClsTraceService(
         appLogProducer = null;
       }
       producer = null;
+      traceProducer = null;
+      logProducer = null;
       metricsProducer = null;
       conversationLogProducer = null;
       sessionLogProducer = null;
