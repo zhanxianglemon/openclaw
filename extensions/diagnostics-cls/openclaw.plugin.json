@@ -85,6 +85,14 @@
       "conversationLogTopicId": {
         "type": "string",
         "description": "对话日志上报的 CLS 主题 ID，不填则使用 topicId（仅 enableConversationLog=true 时生效）"
+      },
+      "traceTopicId": {
+        "type": "string",
+        "description": "Trace 事件上报的 CLS 主题 ID，不填则使用 topicId（仅 enableTraceEvent=true 时生效）"
+      },
+      "logTopicId": {
+        "type": "string",
+        "description": "框架运行日志上报的 CLS 主题 ID，不填则使用 topicId（仅 enableLogTransport=true 时生效）"
       }
     }
   }
