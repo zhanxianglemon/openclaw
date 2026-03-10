@@ -29,7 +29,7 @@
       },
       "enableTraceEvent": {
         "type": "boolean",
-        "description": "是否上传诊断 trace 事件（model.usage / message.processed 等），默认 true"
+        "description": "是否上传诊断 trace 事件（model.usage / webhook.processed / webhook.error / message.processed / session.stuck），默认 true"
       },
       "enableLogTransport": {
         "type": "boolean",
@@ -52,15 +52,11 @@
       },
       "enableAppLog": {
         "type": "boolean",
-        "description": "是否监听应用运行日志文件（/tmp/openclaw/openclaw-YYYY-MM-DD.log）并上报到 CLS，默认 false"
+        "description": "是否通过 registerLogTransport Hook 实时上报应用运行日志到 CLS（零磁盘 I/O），默认 false"
       },
       "enableSessionLog": {
         "type": "boolean",
-        "description": "是否监听 Session JSONL 文件（~/.openclaw/agents/*/sessions/*.jsonl）并上报到 CLS，默认 false"
-      },
-      "stateDir": {
-        "type": "string",
-        "description": "Session JSONL 文件所在的 state 根目录，默认为 ~/.openclaw，dev 环境可设为 ~/.openclaw-dev"
+        "description": "是否通过 before_message_write Hook 实时上报 Session 消息到 CLS（零磁盘 I/O），默认 false"
       },
       "appLogTopicId": {
         "type": "string",
@@ -68,23 +64,7 @@
       },
       "sessionLogTopicId": {
         "type": "string",
-        "description": "Session JSONL 日志上报的 CLS 主题 ID，不填则使用 topicId（仅 enableSessionLog=true 时生效）"
-      },
-      "enableMetrics": {
-        "type": "boolean",
-        "description": "是否上报 Metrics 指标事件（webhook.received / message.queued / queue.lane / session.state / run.attempt / diagnostic.heartbeat），默认 true"
-      },
-      "metricsTopicId": {
-        "type": "string",
-        "description": "Metrics 指标上报的 CLS 主题 ID，不填则使用 topicId"
-      },
-      "enableConversationLog": {
-        "type": "boolean",
-        "description": "是否通过 Plugin Hook 实时上报对话内容（llm_input / llm_output），零磁盘 I/O，默认 false"
-      },
-      "conversationLogTopicId": {
-        "type": "string",
-        "description": "对话日志上报的 CLS 主题 ID，不填则使用 topicId（仅 enableConversationLog=true 时生效）"
+        "description": "Session 消息实时流上报的 CLS 主题 ID，不填则使用 topicId（仅 enableSessionLog=true 时生效）"
       },
       "traceTopicId": {
         "type": "string",
@@ -93,6 +73,22 @@
       "logTopicId": {
         "type": "string",
         "description": "框架运行日志上报的 CLS 主题 ID，不填则使用 topicId（仅 enableLogTransport=true 时生效）"
+      },
+      "enableMetrics": {
+        "type": "boolean",
+        "description": "是否上报 Metrics 指标事件（model.usage / webhook.received / webhook.processed / message.queued / message.processed / queue.lane.enqueue / queue.lane.dequeue / session.state / session.stuck / run.attempt / diagnostic.heartbeat），默认 true"
+      },
+      "metricsTopicId": {
+        "type": "string",
+        "description": "Metrics 指标上报的 CLS 主题 ID，不填则使用 topicId（仅 enableMetrics=true 时生效）"
+      },
+      "enableConversationLog": {
+        "type": "boolean",
+        "description": "是否通过 Plugin Hook 实时上报对话内容（llm_input / llm_output）到 CLS（零磁盘 I/O），默认 false"
+      },
+      "conversationLogTopicId": {
+        "type": "string",
+        "description": "对话日志上报的 CLS 主题 ID，不填则使用 topicId（仅 enableConversationLog=true 时生效）"
       }
     }
   }

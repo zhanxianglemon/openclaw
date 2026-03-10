@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import type {
   DiagnosticEventPayload,
   OpenClawPluginService,
@@ -7,6 +8,14 @@ import {
   redactSensitiveText,
   registerLogTransport,
 } from "openclaw/plugin-sdk/diagnostics-cls";
+
+// ─── 常量 ───────────────────────────────────────────────────────────────────
+
+/** toolResult 字段最大上报字符数，超出则截断 */
+const TOOL_RESULT_MAX_LENGTH = 2000;
+
+/** raw 字段（整条消息 JSON 序列化）最大上报字符数，超出则截断 */
+const RAW_MESSAGE_MAX_LENGTH = 10000;
 
 // ─── 日志级别权重 ──────────────────────────────────────────────────────────────
 
@@ -39,10 +48,8 @@ interface ClsTraceConfig {
   sendCountThreshold: number;
   /** 是否启用应用运行日志文件监听上报（/tmp/openclaw/*.log），默认 false */
   enableAppLog: boolean;
-  /** 是否启用 Session JSONL 文件监听上报（~/.openclaw/agents/AGENT/sessions/SESSION.jsonl），默认 false */
+  /** 是否启用 Session 消息实时流上报（通过 before_message_write Hook，零磁盘 I/O），默认 false */
   enableSessionLog: boolean;
-  /** Session JSONL 文件所在的 state 目录，默认 ~/.openclaw */
-  stateDir: string;
   /** 应用日志上报到的 CLS 主题 ID（不填则使用 topicId） */
   appLogTopicId: string;
   /** Session 日志上报到的 CLS 主题 ID（不填则使用 topicId） */
@@ -51,7 +58,7 @@ interface ClsTraceConfig {
   traceTopicId: string;
   /** 框架运行日志上报到的 CLS 主题 ID（不填则使用 topicId） */
   logTopicId: string;
-  /** 是否启用 Metrics 指标上报（webhook.received / message.queued / queue / session.state / run.attempt / heartbeat），默认 true */
+  /** 是否启用 Metrics 指标上报（model.usage / webhook.received / webhook.processed / message.queued / message.processed / queue.lane.enqueue / queue.lane.dequeue / session.state / session.stuck / run.attempt / diagnostic.heartbeat），默认 true */
   enableMetrics: boolean;
   /** Metrics 上报到的 CLS 主题 ID（不填则使用 topicId） */
   metricsTopicId: string;
@@ -77,19 +84,20 @@ function resolveConfig(pluginConfig: Record<string, unknown> | undefined): ClsTr
       ? pluginConfig.source.trim()
       : "openclaw";
 
-  const enableTraceEvent = pluginConfig?.enableTraceEvent === false ? false : true;
-
-  const enableLogTransport = pluginConfig?.enableLogTransport === false ? false : true;
+  // enableTraceEvent / enableLogTransport / enableMetrics 默认 true（opt-out），用 !== false 判断
+  // enableAppLog / enableSessionLog / enableConversationLog 默认 false（opt-in），用 === true 判断
+  const enableTraceEvent = pluginConfig?.enableTraceEvent !== false;
+  const enableLogTransport = pluginConfig?.enableLogTransport !== false;
 
   const minLevel =
     typeof pluginConfig?.minLevel === "string" &&
     LOG_LEVEL_WEIGHT[pluginConfig.minLevel] !== undefined
       ? pluginConfig.minLevel
-      : "trace";
+      : "info";
 
   const sendTimeThreshold =
     typeof pluginConfig?.sendTimeThreshold === "number" && pluginConfig.sendTimeThreshold >= 1
-      ? pluginConfig.sendTimeThreshold
+      ? Math.floor(pluginConfig.sendTimeThreshold)
       : 2;
 
   const sendCountThreshold =
@@ -99,11 +107,6 @@ function resolveConfig(pluginConfig: Record<string, unknown> | undefined): ClsTr
 
   const enableAppLog = pluginConfig?.enableAppLog === true;
   const enableSessionLog = pluginConfig?.enableSessionLog === true;
-
-  const stateDir =
-    typeof pluginConfig?.stateDir === "string" && pluginConfig.stateDir.trim()
-      ? pluginConfig.stateDir.trim()
-      : "";
 
   const appLogTopicId =
     typeof pluginConfig?.appLogTopicId === "string" && pluginConfig.appLogTopicId.trim()
@@ -125,7 +128,7 @@ function resolveConfig(pluginConfig: Record<string, unknown> | undefined): ClsTr
       ? pluginConfig.logTopicId.trim()
       : topicId;
 
-  const enableMetrics = pluginConfig?.enableMetrics === false ? false : true;
+  const enableMetrics = pluginConfig?.enableMetrics !== false;
 
   const metricsTopicId =
     typeof pluginConfig?.metricsTopicId === "string" && pluginConfig.metricsTopicId.trim()
@@ -153,15 +156,14 @@ function resolveConfig(pluginConfig: Record<string, unknown> | undefined): ClsTr
     sendCountThreshold,
     enableAppLog,
     enableSessionLog,
-    stateDir,
     appLogTopicId,
     sessionLogTopicId,
+    traceTopicId,
+    logTopicId,
     enableMetrics,
     metricsTopicId,
     enableConversationLog,
     conversationLogTopicId,
-    traceTopicId,
-    logTopicId,
   };
 }
 
@@ -212,9 +214,9 @@ function buildModelUsageSpan(
       "openclaw.sessionId": evt.sessionId ?? "",
       "openclaw.tokens.input": evt.usage?.input ?? 0,
       "openclaw.tokens.output": evt.usage?.output ?? 0,
-      // 使用下划线命名风格
-      "openclaw.tokens.cache_read": evt.usage?.cacheRead ?? 0,
-      "openclaw.tokens.cache_write": evt.usage?.cacheWrite ?? 0,
+      // 统一使用驼峰命名风格
+      "openclaw.tokens.cacheRead": evt.usage?.cacheRead ?? 0,
+      "openclaw.tokens.cacheWrite": evt.usage?.cacheWrite ?? 0,
       // 补充 promptTokens
       ...(evt.usage?.promptTokens ? { "openclaw.tokens.prompt": evt.usage.promptTokens } : {}),
       "openclaw.tokens.total": evt.usage?.total ?? 0,
@@ -256,11 +258,12 @@ function buildWebhookErrorSpan(
     "openclaw.error": redactedError,
   };
   if (evt.chatId !== undefined) attrs["openclaw.chatId"] = String(evt.chatId);
+  const now = nowIso();
   return {
     name: "openclaw.webhook.error",
     eventType: evt.type,
-    startTime: nowIso(),
-    endTime: nowIso(),
+    startTime: now,
+    endTime: now,
     status: "error",
     errorMessage: redactedError,
     seq: evt.seq,
@@ -309,245 +312,14 @@ function buildSessionStuckSpan(
   };
   if (evt.sessionKey) attrs["openclaw.sessionKey"] = evt.sessionKey;
   if (evt.sessionId) attrs["openclaw.sessionId"] = evt.sessionId;
+  const now = nowIso();
   return {
     name: "openclaw.session.stuck",
     eventType: evt.type,
-    startTime: nowIso(),
-    endTime: nowIso(),
+    startTime: now,
+    endTime: now,
     status: "error",
     errorMessage: "session stuck",
-    seq: evt.seq,
-    attributes: attrs,
-  };
-}
-
-// ─── 额外 Metrics 条目构建 ────────
-
-/**
- * model.usage 额外 Metric：按 token 类型拆分上报（对应 otel 的 tokensCounter）
- */
-function buildModelUsageTokensMetrics(
-  evt: Extract<DiagnosticEventPayload, { type: "model.usage" }>,
-): MetricEntry[] {
-  const attrs: Record<string, string | number | boolean> = {
-    "openclaw.channel": evt.channel ?? "unknown",
-    "openclaw.provider": evt.provider ?? "unknown",
-    "openclaw.model": evt.model ?? "unknown",
-  };
-  const usage = evt.usage;
-  const entries: MetricEntry[] = [];
-  const tokenTypes: Array<[keyof typeof usage, string]> = [
-    ["input", "input"],
-    ["output", "output"],
-    ["cacheRead", "cache_read"],
-    ["cacheWrite", "cache_write"],
-    ["promptTokens", "prompt"],
-    ["total", "total"],
-  ];
-  for (const [field, tokenType] of tokenTypes) {
-    const val = usage?.[field];
-    if (typeof val === "number" && val > 0) {
-      entries.push({
-        metricName: "openclaw.tokens",
-        eventType: evt.type,
-        timestamp: nowIso(),
-        seq: evt.seq,
-        attributes: { ...attrs, "openclaw.token": tokenType, "openclaw.value": val },
-      });
-    }
-  }
-  return entries;
-}
-
-/**
- * model.usage 额外 Metric：上报 cost（对应 otel 的 costCounter）
- */
-function buildModelUsageCostMetric(
-  evt: Extract<DiagnosticEventPayload, { type: "model.usage" }>,
-): MetricEntry | null {
-  if (!evt.costUsd) return null;
-  return {
-    metricName: "openclaw.cost.usd",
-    eventType: evt.type,
-    timestamp: nowIso(),
-    seq: evt.seq,
-    attributes: {
-      "openclaw.channel": evt.channel ?? "unknown",
-      "openclaw.provider": evt.provider ?? "unknown",
-      "openclaw.model": evt.model ?? "unknown",
-      "openclaw.value": evt.costUsd,
-    },
-  };
-}
-
-/**
- * model.usage 额外 Metric：上报运行耗时（对应 otel 的 durationHistogram）
- */
-function buildModelUsageDurationMetric(
-  evt: Extract<DiagnosticEventPayload, { type: "model.usage" }>,
-): MetricEntry | null {
-  if (!evt.durationMs) return null;
-  return {
-    metricName: "openclaw.run.duration_ms",
-    eventType: evt.type,
-    timestamp: nowIso(),
-    seq: evt.seq,
-    attributes: {
-      "openclaw.channel": evt.channel ?? "unknown",
-      "openclaw.provider": evt.provider ?? "unknown",
-      "openclaw.model": evt.model ?? "unknown",
-      "openclaw.value": evt.durationMs,
-    },
-  };
-}
-
-/**
- * model.usage 额外 Metric：上报上下文窗口大小（对应 otel 的 contextHistogram）
- */
-function buildModelUsageContextMetrics(
-  evt: Extract<DiagnosticEventPayload, { type: "model.usage" }>,
-): MetricEntry[] {
-  const attrs: Record<string, string | number | boolean> = {
-    "openclaw.channel": evt.channel ?? "unknown",
-    "openclaw.provider": evt.provider ?? "unknown",
-    "openclaw.model": evt.model ?? "unknown",
-  };
-  const entries: MetricEntry[] = [];
-  if (evt.context?.limit) {
-    entries.push({
-      metricName: "openclaw.context.tokens",
-      eventType: evt.type,
-      timestamp: nowIso(),
-      seq: evt.seq,
-      attributes: { ...attrs, "openclaw.context": "limit", "openclaw.value": evt.context.limit },
-    });
-  }
-  if (evt.context?.used) {
-    entries.push({
-      metricName: "openclaw.context.tokens",
-      eventType: evt.type,
-      timestamp: nowIso(),
-      seq: evt.seq,
-      attributes: { ...attrs, "openclaw.context": "used", "openclaw.value": evt.context.used },
-    });
-  }
-  return entries;
-}
-
-/**
- * webhook.processed 额外 Metric：记录 webhook 处理耗时
- */
-function buildWebhookProcessedDurationMetric(
-  evt: Extract<DiagnosticEventPayload, { type: "webhook.processed" }>,
-): MetricEntry | null {
-  if (typeof evt.durationMs !== "number") return null;
-  return {
-    metricName: "openclaw.webhook.duration_ms",
-    eventType: evt.type,
-    timestamp: nowIso(),
-    seq: evt.seq,
-    attributes: {
-      "openclaw.channel": evt.channel ?? "unknown",
-      "openclaw.webhook": evt.updateType ?? "unknown",
-      "openclaw.durationMs": evt.durationMs,
-    },
-  };
-}
-
-/**
- * message.processed 额外 Metric：记录消息处理计数和耗时
- */
-function buildMessageProcessedMetric(
-  evt: Extract<DiagnosticEventPayload, { type: "message.processed" }>,
-): MetricEntry {
-  const attrs: Record<string, string | number | boolean> = {
-    "openclaw.channel": evt.channel ?? "unknown",
-    "openclaw.outcome": evt.outcome ?? "unknown",
-  };
-  if (typeof evt.durationMs === "number") attrs["openclaw.durationMs"] = evt.durationMs;
-  return {
-    metricName: "openclaw.message.processed",
-    eventType: evt.type,
-    timestamp: nowIso(),
-    seq: evt.seq,
-    attributes: attrs,
-  };
-}
-
-/**
- * message.queued 额外 Metric：记录队列深度
- */
-function buildMessageQueuedDepthMetric(
-  evt: Extract<DiagnosticEventPayload, { type: "message.queued" }>,
-): MetricEntry | null {
-  if (typeof evt.queueDepth !== "number") return null;
-  return {
-    metricName: "openclaw.queue.depth",
-    eventType: evt.type,
-    timestamp: nowIso(),
-    seq: evt.seq,
-    attributes: {
-      "openclaw.channel": evt.channel ?? "unknown",
-      "openclaw.source": evt.source ?? "unknown",
-      "openclaw.queueDepth": evt.queueDepth,
-    },
-  };
-}
-
-/**
- * queue.lane.enqueue 额外 Metric：记录队列深度 histogram
- */
-function buildLaneEnqueueDepthMetric(
-  evt: Extract<DiagnosticEventPayload, { type: "queue.lane.enqueue" }>,
-): MetricEntry {
-  return {
-    metricName: "openclaw.queue.depth",
-    eventType: evt.type,
-    timestamp: nowIso(),
-    seq: evt.seq,
-    attributes: {
-      "openclaw.lane": evt.lane,
-      "openclaw.queueSize": evt.queueSize,
-    },
-  };
-}
-
-/**
- * queue.lane.dequeue 额外 Metric：记录队列深度 + 等待时间 histogram
- */
-function buildLaneDequeueDepthMetric(
-  evt: Extract<DiagnosticEventPayload, { type: "queue.lane.dequeue" }>,
-): MetricEntry {
-  const attrs: Record<string, string | number | boolean> = {
-    "openclaw.lane": evt.lane,
-    "openclaw.queueSize": evt.queueSize,
-  };
-  if (typeof evt.waitMs === "number") attrs["openclaw.waitMs"] = evt.waitMs;
-  return {
-    metricName: "openclaw.queue.depth",
-    eventType: evt.type,
-    timestamp: nowIso(),
-    seq: evt.seq,
-    attributes: attrs,
-  };
-}
-
-/**
- * session.stuck 额外 Metric：记录 stuck 年龄 histogram
- */
-function buildSessionStuckAgeMetric(
-  evt: Extract<DiagnosticEventPayload, { type: "session.stuck" }>,
-): MetricEntry {
-  const attrs: Record<string, string | number | boolean> = {
-    "openclaw.state": evt.state,
-    "openclaw.ageMs": evt.ageMs,
-  };
-  if (evt.sessionKey) attrs["openclaw.sessionKey"] = evt.sessionKey;
-  if (evt.sessionId) attrs["openclaw.sessionId"] = evt.sessionId;
-  return {
-    metricName: "openclaw.session.stuck_age_ms",
-    eventType: evt.type,
-    timestamp: nowIso(),
     seq: evt.seq,
     attributes: attrs,
   };
@@ -566,15 +338,258 @@ interface MetricEntry {
   seq: number;
 }
 
+// ─── 额外 Metrics 条目构建 ────────
+
+/**
+ * model.usage 额外 Metric：按 token 类型拆分上报（对应 otel 的 tokensCounter）
+ */
+function buildModelUsageTokensMetrics(
+  evt: Extract<DiagnosticEventPayload, { type: "model.usage" }>,
+  now: string,
+): MetricEntry[] {
+  const attrs: Record<string, string | number | boolean> = {
+    "openclaw.channel": evt.channel ?? "unknown",
+    "openclaw.provider": evt.provider ?? "unknown",
+    "openclaw.model": evt.model ?? "unknown",
+  };
+  const usage = evt.usage;
+  const entries: MetricEntry[] = [];
+  const tokenTypes: Array<[keyof typeof usage, string]> = [
+    ["input", "input"],
+    ["output", "output"],
+    ["cacheRead", "cacheRead"],
+    ["cacheWrite", "cacheWrite"],
+    ["promptTokens", "prompt"],
+    ["total", "total"],
+  ];
+  for (const [field, tokenType] of tokenTypes) {
+    const val = usage?.[field];
+    if (typeof val === "number" && val > 0) {
+      entries.push({
+        metricName: "openclaw.tokens",
+        eventType: evt.type,
+        timestamp: now,
+        seq: evt.seq,
+        attributes: { ...attrs, "openclaw.token": tokenType, "openclaw.value": val },
+      });
+    }
+  }
+  return entries;
+}
+
+/**
+ * model.usage 额外 Metric：上报 cost（对应 otel 的 costCounter）
+ */
+function buildModelUsageCostMetric(
+  evt: Extract<DiagnosticEventPayload, { type: "model.usage" }>,
+  now: string,
+): MetricEntry | null {
+  if (!evt.costUsd) return null;
+  return {
+    metricName: "openclaw.cost.usd",
+    eventType: evt.type,
+    timestamp: now,
+    seq: evt.seq,
+    attributes: {
+      "openclaw.channel": evt.channel ?? "unknown",
+      "openclaw.provider": evt.provider ?? "unknown",
+      "openclaw.model": evt.model ?? "unknown",
+      "openclaw.value": evt.costUsd,
+    },
+  };
+}
+
+/**
+ * model.usage 额外 Metric：上报运行耗时（对应 otel 的 durationHistogram）
+ */
+function buildModelUsageDurationMetric(
+  evt: Extract<DiagnosticEventPayload, { type: "model.usage" }>,
+  now: string,
+): MetricEntry | null {
+  if (!evt.durationMs) return null;
+  return {
+    metricName: "openclaw.run.duration_ms",
+    eventType: evt.type,
+    timestamp: now,
+    seq: evt.seq,
+    attributes: {
+      "openclaw.channel": evt.channel ?? "unknown",
+      "openclaw.provider": evt.provider ?? "unknown",
+      "openclaw.model": evt.model ?? "unknown",
+      "openclaw.value": evt.durationMs,
+    },
+  };
+}
+
+/**
+ * model.usage 额外 Metric：上报上下文窗口大小（对应 otel 的 contextHistogram）
+ */
+function buildModelUsageContextMetrics(
+  evt: Extract<DiagnosticEventPayload, { type: "model.usage" }>,
+  now: string,
+): MetricEntry[] {
+  const attrs: Record<string, string | number | boolean> = {
+    "openclaw.channel": evt.channel ?? "unknown",
+    "openclaw.provider": evt.provider ?? "unknown",
+    "openclaw.model": evt.model ?? "unknown",
+  };
+  const entries: MetricEntry[] = [];
+  if (evt.context?.limit) {
+    entries.push({
+      metricName: "openclaw.context.tokens",
+      eventType: evt.type,
+      timestamp: now,
+      seq: evt.seq,
+      attributes: { ...attrs, "openclaw.context": "limit", "openclaw.value": evt.context.limit },
+    });
+  }
+  if (evt.context?.used) {
+    entries.push({
+      metricName: "openclaw.context.tokens",
+      eventType: evt.type,
+      timestamp: now,
+      seq: evt.seq,
+      attributes: { ...attrs, "openclaw.context": "used", "openclaw.value": evt.context.used },
+    });
+  }
+  return entries;
+}
+
+/**
+ * webhook.processed 额外 Metric：记录 webhook 处理耗时
+ */
+function buildWebhookProcessedDurationMetric(
+  evt: Extract<DiagnosticEventPayload, { type: "webhook.processed" }>,
+  now: string,
+): MetricEntry | null {
+  if (typeof evt.durationMs !== "number") return null;
+  return {
+    metricName: "openclaw.webhook.duration_ms",
+    eventType: evt.type,
+    timestamp: now,
+    seq: evt.seq,
+    attributes: {
+      "openclaw.channel": evt.channel ?? "unknown",
+      "openclaw.webhook": evt.updateType ?? "unknown",
+      "openclaw.durationMs": evt.durationMs,
+    },
+  };
+}
+
+/**
+ * message.processed 额外 Metric：记录消息处理计数和耗时
+ */
+function buildMessageProcessedMetric(
+  evt: Extract<DiagnosticEventPayload, { type: "message.processed" }>,
+  now: string,
+): MetricEntry {
+  const attrs: Record<string, string | number | boolean> = {
+    "openclaw.channel": evt.channel ?? "unknown",
+    "openclaw.outcome": evt.outcome ?? "unknown",
+  };
+  if (typeof evt.durationMs === "number") attrs["openclaw.durationMs"] = evt.durationMs;
+  return {
+    metricName: "openclaw.message.processed",
+    eventType: evt.type,
+    timestamp: now,
+    seq: evt.seq,
+    attributes: attrs,
+  };
+}
+
+/**
+ * message.queued 额外 Metric：记录队列深度
+ */
+function buildMessageQueuedDepthMetric(
+  evt: Extract<DiagnosticEventPayload, { type: "message.queued" }>,
+  now: string,
+): MetricEntry | null {
+  if (typeof evt.queueDepth !== "number") return null;
+  return {
+    metricName: "openclaw.queue.depth",
+    eventType: evt.type,
+    timestamp: now,
+    seq: evt.seq,
+    attributes: {
+      "openclaw.channel": evt.channel ?? "unknown",
+      "openclaw.source": evt.source ?? "unknown",
+      "openclaw.queueDepth": evt.queueDepth,
+    },
+  };
+}
+
+/**
+ * queue.lane.enqueue 额外 Metric：记录队列深度 histogram
+ */
+function buildLaneEnqueueDepthMetric(
+  evt: Extract<DiagnosticEventPayload, { type: "queue.lane.enqueue" }>,
+  now: string,
+): MetricEntry {
+  return {
+    metricName: "openclaw.queue.depth",
+    eventType: evt.type,
+    timestamp: now,
+    seq: evt.seq,
+    attributes: {
+      "openclaw.lane": evt.lane,
+      "openclaw.queueSize": evt.queueSize,
+    },
+  };
+}
+
+/**
+ * queue.lane.dequeue 额外 Metric：记录队列深度 + 等待时间 histogram
+ */
+function buildLaneDequeueDepthMetric(
+  evt: Extract<DiagnosticEventPayload, { type: "queue.lane.dequeue" }>,
+  now: string,
+): MetricEntry {
+  const attrs: Record<string, string | number | boolean> = {
+    "openclaw.lane": evt.lane,
+    "openclaw.queueSize": evt.queueSize,
+  };
+  if (typeof evt.waitMs === "number") attrs["openclaw.waitMs"] = evt.waitMs;
+  return {
+    metricName: "openclaw.queue.depth",
+    eventType: evt.type,
+    timestamp: now,
+    seq: evt.seq,
+    attributes: attrs,
+  };
+}
+
+/**
+ * session.stuck 额外 Metric：记录 stuck 年龄 histogram
+ */
+function buildSessionStuckAgeMetric(
+  evt: Extract<DiagnosticEventPayload, { type: "session.stuck" }>,
+  now: string,
+): MetricEntry {
+  const attrs: Record<string, string | number | boolean> = {
+    "openclaw.state": evt.state,
+    "openclaw.ageMs": evt.ageMs,
+  };
+  if (evt.sessionKey) attrs["openclaw.sessionKey"] = evt.sessionKey;
+  if (evt.sessionId) attrs["openclaw.sessionId"] = evt.sessionId;
+  return {
+    metricName: "openclaw.session.stuck_age_ms",
+    eventType: evt.type,
+    timestamp: now,
+    seq: evt.seq,
+    attributes: attrs,
+  };
+}
+
 // ─── Metrics 条目构建 ─────────────────────────────────────────────────────────
 
 function buildWebhookReceivedMetric(
   evt: Extract<DiagnosticEventPayload, { type: "webhook.received" }>,
+  now: string,
 ): MetricEntry {
   return {
     metricName: "openclaw.webhook.received",
     eventType: evt.type,
-    timestamp: nowIso(),
+    timestamp: now,
     seq: evt.seq,
     attributes: {
       "openclaw.channel": evt.channel ?? "unknown",
@@ -585,6 +600,7 @@ function buildWebhookReceivedMetric(
 
 function buildMessageQueuedMetric(
   evt: Extract<DiagnosticEventPayload, { type: "message.queued" }>,
+  now: string,
 ): MetricEntry {
   const attrs: Record<string, string | number | boolean> = {
     "openclaw.channel": evt.channel ?? "unknown",
@@ -594,7 +610,7 @@ function buildMessageQueuedMetric(
   return {
     metricName: "openclaw.message.queued",
     eventType: evt.type,
-    timestamp: nowIso(),
+    timestamp: now,
     seq: evt.seq,
     attributes: attrs,
   };
@@ -602,11 +618,12 @@ function buildMessageQueuedMetric(
 
 function buildLaneEnqueueMetric(
   evt: Extract<DiagnosticEventPayload, { type: "queue.lane.enqueue" }>,
+  now: string,
 ): MetricEntry {
   return {
     metricName: "openclaw.queue.lane.enqueue",
     eventType: evt.type,
-    timestamp: nowIso(),
+    timestamp: now,
     seq: evt.seq,
     attributes: {
       "openclaw.lane": evt.lane,
@@ -617,6 +634,7 @@ function buildLaneEnqueueMetric(
 
 function buildLaneDequeueMetric(
   evt: Extract<DiagnosticEventPayload, { type: "queue.lane.dequeue" }>,
+  now: string,
 ): MetricEntry {
   const attrs: Record<string, string | number | boolean> = {
     "openclaw.lane": evt.lane,
@@ -626,7 +644,7 @@ function buildLaneDequeueMetric(
   return {
     metricName: "openclaw.queue.lane.dequeue",
     eventType: evt.type,
-    timestamp: nowIso(),
+    timestamp: now,
     seq: evt.seq,
     attributes: attrs,
   };
@@ -634,6 +652,7 @@ function buildLaneDequeueMetric(
 
 function buildSessionStateMetric(
   evt: Extract<DiagnosticEventPayload, { type: "session.state" }>,
+  now: string,
 ): MetricEntry {
   const attrs: Record<string, string | number | boolean> = {
     "openclaw.state": evt.state,
@@ -644,7 +663,7 @@ function buildSessionStateMetric(
   return {
     metricName: "openclaw.session.state",
     eventType: evt.type,
-    timestamp: nowIso(),
+    timestamp: now,
     seq: evt.seq,
     attributes: attrs,
   };
@@ -652,11 +671,12 @@ function buildSessionStateMetric(
 
 function buildRunAttemptMetric(
   evt: Extract<DiagnosticEventPayload, { type: "run.attempt" }>,
+  now: string,
 ): MetricEntry {
   return {
     metricName: "openclaw.run.attempt",
     eventType: evt.type,
-    timestamp: nowIso(),
+    timestamp: now,
     seq: evt.seq,
     attributes: {
       "openclaw.attempt": evt.attempt,
@@ -666,11 +686,12 @@ function buildRunAttemptMetric(
 
 function buildHeartbeatMetric(
   evt: Extract<DiagnosticEventPayload, { type: "diagnostic.heartbeat" }>,
+  now: string,
 ): MetricEntry {
   return {
     metricName: "openclaw.diagnostic.heartbeat",
     eventType: evt.type,
-    timestamp: nowIso(),
+    timestamp: now,
     seq: evt.seq,
     attributes: {
       "openclaw.queued": evt.queued,
@@ -680,6 +701,7 @@ function buildHeartbeatMetric(
 
 function buildSessionStuckMetric(
   evt: Extract<DiagnosticEventPayload, { type: "session.stuck" }>,
+  now: string,
 ): MetricEntry {
   const attrs: Record<string, string | number | boolean> = {
     "openclaw.state": evt.state,
@@ -691,13 +713,12 @@ function buildSessionStuckMetric(
   return {
     metricName: "openclaw.session.stuck",
     eventType: evt.type,
-    timestamp: nowIso(),
+    timestamp: now,
     seq: evt.seq,
     attributes: attrs,
   };
 }
 
-// ─── logObj 解析
 // ─── logObj 解析 ──────────────────────────────────────────────────────────────
 
 /**
@@ -833,30 +854,85 @@ export type DiagnosticsClsService = OpenClawPluginService & {
   sendSessionMessage: (message: unknown, sessionKey?: string) => void;
 };
 
+/**
+ * CLS LogItem 实例最小接口
+ * （tencentcloud-cls-sdk-nodejs 无官方类型声明，此处手动声明最小接口）
+ */
+interface LogItemInstance {
+  setTime(time: number): void;
+  pushBack(content: unknown): void;
+}
+
+/**
+ * CLS Producer 最小接口，用于替代 any 类型，提供基本类型安全
+ * （tencentcloud-cls-sdk-nodejs 无官方类型声明，此处手动声明最小接口）
+ */
+interface Producer {
+  send(item: LogItemInstance): Promise<unknown>;
+}
+
+/**
+ * 创建 CLS Producer 实例的工厂函数，避免重复的初始化样板代码
+ */
+function createProducer(
+  ns: Record<string, unknown>,
+  topicId: string,
+  cfg: ClsTraceConfig,
+  label: string,
+  onError: (msg: string) => void,
+): Producer {
+  const ProducerCtor = ns.Producer as new (...args: unknown[]) => Producer;
+  return new ProducerCtor({
+    topic_id: topicId,
+    endpoint: cfg.endpoint,
+    credential: {
+      secretId: cfg.secretId,
+      secretKey: cfg.secretKey,
+    },
+    time: cfg.sendTimeThreshold,
+    count: cfg.sendCountThreshold,
+    onSendLogsError: (result: unknown) => {
+      if (
+        result !== null &&
+        typeof result === "object" &&
+        (result as Record<string, unknown>).status === 200
+      ) {
+        return;
+      }
+      let errMsg: string;
+      if (result instanceof Error) {
+        errMsg = result.message;
+      } else if (typeof result === "object" && result !== null) {
+        try {
+          errMsg = JSON.stringify(result);
+        } catch {
+          errMsg = Object.prototype.toString.call(result);
+        }
+      } else {
+        errMsg = String(result);
+      }
+      onError(`${label} - ${errMsg}`);
+    },
+  });
+}
+
 export function createDiagnosticsClsTraceService(
   pluginConfig?: Record<string, unknown>,
 ): DiagnosticsClsService {
+  // ctx 提升为闭包变量，在 start(ctx) 时赋值，供 sendSpan / sendMetric 等闭包使用
+  let serviceCtx: Parameters<OpenClawPluginService["start"]>[0] | null = null;
   let unsubscribe: (() => void) | null = null;
   let stopTransport: (() => void) | null = null;
   let stopAppLogTransport: (() => void) | null = null;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let producer: any = null;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let traceProducer: any = null;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let logProducer: any = null;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let metricsProducer: any = null;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let conversationLogProducer: any = null;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let sessionLogProducer: any = null;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let appLogProducer: any = null;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let LogItem: any = null;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let Content: any = null;
+  let producer: Producer | null = null;
+  let traceProducer: Producer | null = null;
+  let logProducer: Producer | null = null;
+  let metricsProducer: Producer | null = null;
+  let conversationLogProducer: Producer | null = null;
+  let sessionLogProducer: Producer | null = null;
+  let appLogProducer: Producer | null = null;
+  let LogItem: (new () => LogItemInstance) | null = null;
+  let Content: (new (key: string, value: string) => unknown) | null = null;
 
   const cfg = resolveConfig(pluginConfig);
   const minLevelWeight = cfg ? (LOG_LEVEL_WEIGHT[cfg.minLevel] ?? 0) : 0;
@@ -868,7 +944,8 @@ export function createDiagnosticsClsTraceService(
     if (!traceProducer || !LogItem || !Content) return;
     try {
       const item = new LogItem();
-      item.setTime(Math.floor(Date.now() / 1000));
+      // 使用 span 的实际结束时间作为 CLS 日志时间，而非发送时刻
+      item.setTime(Math.floor(new Date(span.endTime).getTime() / 1000));
 
       item.pushBack(new Content("name", span.name));
       item.pushBack(new Content("eventType", span.eventType));
@@ -890,7 +967,7 @@ export function createDiagnosticsClsTraceService(
 
       traceProducer.send(item).catch((e: unknown) => {
         const msg = e instanceof Error ? e.message : JSON.stringify(e);
-        console.warn(`[diagnostics-cls] send 失败: ${msg}`);
+        serviceCtx?.logger.warn(`diagnostics-cls: span send 失败: ${msg}`);
       });
     } catch {
       // 构建或发送失败时静默忽略
@@ -945,7 +1022,9 @@ export function createDiagnosticsClsTraceService(
             for (const field of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"]) {
               const val = usage[field];
               if (typeof val === "number") {
-                contents.push({ key: `usage_${field}`, value: String(val) });
+                // 使用驼峰风格：usage.input / usage.output / usage.cacheRead 等
+                const key = `usage.${field}`;
+                contents.push({ key, value: String(val) });
               }
             }
             const cost = usage["cost"] as Record<string, unknown> | undefined;
@@ -953,7 +1032,8 @@ export function createDiagnosticsClsTraceService(
               for (const field of ["input", "output", "cacheRead", "cacheWrite", "total"]) {
                 const val = cost[field];
                 if (typeof val === "number") {
-                  contents.push({ key: `cost_${field}`, value: val.toFixed(8) });
+                  // 使用驼峰风格：cost.input / cost.output / cost.cacheRead 等
+                  contents.push({ key: `cost.${field}`, value: val.toFixed(8) });
                 }
               }
             }
@@ -1004,7 +1084,8 @@ export function createDiagnosticsClsTraceService(
                 contents.push({ key: "toolCalls", value: toolCalls.join(",") });
               }
             } else if (role === "toolResult") {
-              const toolName = inner["toolName"];
+              // 优先取 msg 顶层的 toolName，再 fallback 到 inner.toolName
+              const toolName = msg["toolName"] ?? inner["toolName"];
               if (typeof toolName === "string") {
                 contents.push({ key: "toolName", value: toolName });
               }
@@ -1028,7 +1109,10 @@ export function createDiagnosticsClsTraceService(
                 const resultText = resultParts.join("\n");
                 contents.push({
                   key: "toolResult",
-                  value: resultText.length > 2000 ? resultText.slice(0, 2000) + "…" : resultText,
+                  value:
+                    resultText.length > TOOL_RESULT_MAX_LENGTH
+                      ? resultText.slice(0, TOOL_RESULT_MAX_LENGTH) + "…"
+                      : resultText,
                 });
               }
             }
@@ -1036,9 +1120,16 @@ export function createDiagnosticsClsTraceService(
         }
       }
 
-      // 原始 JSON 备份
+      // 原始 JSON 备份（截断超长内容，避免超出 CLS 单条日志大小限制）
       try {
-        contents.push({ key: "raw", value: JSON.stringify(msg) });
+        const rawStr = JSON.stringify(msg);
+        contents.push({
+          key: "raw",
+          value:
+            rawStr.length > RAW_MESSAGE_MAX_LENGTH
+              ? rawStr.slice(0, RAW_MESSAGE_MAX_LENGTH) + "…"
+              : rawStr,
+        });
       } catch {
         // ignore
       }
@@ -1050,7 +1141,7 @@ export function createDiagnosticsClsTraceService(
       }
       sessionLogProducer.send(item).catch((e: unknown) => {
         const errMsg = e instanceof Error ? e.message : JSON.stringify(e);
-        console.warn(`[diagnostics-cls] session message send 失败: ${errMsg}`);
+        serviceCtx?.logger.warn(`diagnostics-cls: session message send 失败: ${errMsg}`);
       });
     } catch {
       // 静默忽略
@@ -1065,13 +1156,15 @@ export function createDiagnosticsClsTraceService(
     if (!conversationLogProducer || !LogItem || !Content) return;
     try {
       const item = new LogItem();
-      item.setTime(Math.floor(Date.now() / 1000));
+      // 优先使用 fields 中的 timestamp 字段作为 CLS 日志时间，fallback 到当前时间
+      const tsMs = fields["timestamp"] ? new Date(fields["timestamp"]).getTime() : NaN;
+      item.setTime(Math.floor((isNaN(tsMs) ? Date.now() : tsMs) / 1000));
       for (const [k, v] of Object.entries(fields)) {
         item.pushBack(new Content(k, v));
       }
       conversationLogProducer.send(item).catch((e: unknown) => {
         const msg = e instanceof Error ? e.message : JSON.stringify(e);
-        console.warn(`[diagnostics-cls] conversation log send 失败: ${msg}`);
+        serviceCtx?.logger.warn(`diagnostics-cls: conversation log send 失败: ${msg}`);
       });
     } catch {
       // 静默忽略
@@ -1085,7 +1178,8 @@ export function createDiagnosticsClsTraceService(
     if (!metricsProducer || !LogItem || !Content) return;
     try {
       const item = new LogItem();
-      item.setTime(Math.floor(Date.now() / 1000));
+      // 使用 metric 的实际事件时间作为 CLS 日志时间，而非发送时刻
+      item.setTime(Math.floor(new Date(metric.timestamp).getTime() / 1000));
 
       item.pushBack(new Content("logType", "metric"));
       item.pushBack(new Content("metricName", metric.metricName));
@@ -1099,7 +1193,7 @@ export function createDiagnosticsClsTraceService(
 
       metricsProducer.send(item).catch((e: unknown) => {
         const msg = e instanceof Error ? e.message : JSON.stringify(e);
-        console.warn(`[diagnostics-cls] metric send 失败: ${msg}`);
+        serviceCtx?.logger.warn(`diagnostics-cls: metric send 失败: ${msg}`);
       });
     } catch {
       // 构建或发送失败时静默忽略
@@ -1114,6 +1208,8 @@ export function createDiagnosticsClsTraceService(
     sendSessionMessage,
 
     async start(ctx) {
+      // 将 ctx 赋值给外部闭包变量，供 sendSpan / sendMetric 等函数使用
+      serviceCtx = ctx;
       if (!cfg) {
         ctx.logger.warn(
           "diagnostics-cls: 缺少必要配置（topicId / secretId / secretKey / endpoint），插件已禁用",
@@ -1122,49 +1218,17 @@ export function createDiagnosticsClsTraceService(
       }
 
       // 动态导入 CLS SDK
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       let ns: Record<string, unknown> = {};
       try {
-        // eslint-disable-next-line @typescript-eslint/ban-ts-comment
         // @ts-ignore tencentcloud-cls-sdk-nodejs 无类型声明
         const clsSdk = await import("tencentcloud-cls-sdk-nodejs");
         ns = (clsSdk.Producer ? clsSdk : clsSdk.default) as Record<string, unknown>;
-        const Producer = ns.Producer as new (...args: unknown[]) => unknown;
-        LogItem = ns.LogItem;
-        Content = ns.Content;
+        LogItem = ns.LogItem as (new () => LogItemInstance) | null;
+        Content = ns.Content as (new (key: string, value: string) => unknown) | null;
 
-        producer = new Producer({
-          topic_id: cfg.topicId,
-          endpoint: cfg.endpoint,
-          credential: {
-            secretId: cfg.secretId,
-            secretKey: cfg.secretKey,
-          },
-          time: cfg.sendTimeThreshold,
-          count: cfg.sendCountThreshold,
-          onSendLogsError: (result: unknown) => {
-            if (
-              result !== null &&
-              typeof result === "object" &&
-              (result as Record<string, unknown>).status === 200
-            ) {
-              return;
-            }
-            let errMsg: string;
-            if (result instanceof Error) {
-              errMsg = result.message;
-            } else if (typeof result === "object" && result !== null) {
-              try {
-                errMsg = JSON.stringify(result);
-              } catch {
-                errMsg = Object.prototype.toString.call(result);
-              }
-            } else {
-              errMsg = String(result);
-            }
-            ctx.logger.warn(`diagnostics-cls: 日志上传失败 - ${errMsg}`);
-          },
-        });
+        producer = createProducer(ns, cfg.topicId, cfg, "日志上传失败", (msg) =>
+          ctx.logger.warn(`diagnostics-cls: ${msg}`),
+        );
       } catch (err) {
         ctx.logger.error(
           `diagnostics-cls: 加载 tencentcloud-cls-sdk-nodejs 失败，请确认已安装该依赖。错误：${String(err)}`,
@@ -1174,173 +1238,59 @@ export function createDiagnosticsClsTraceService(
       }
 
       // 初始化 Trace 事件 producer（若 traceTopicId 与主 topicId 不同则创建独立实例）
-      if (cfg.traceTopicId === cfg.topicId) {
-        traceProducer = producer;
-      } else {
-        const ProducerClsTrace = ns.Producer as new (...args: unknown[]) => unknown;
-        traceProducer = new ProducerClsTrace({
-          topic_id: cfg.traceTopicId,
-          endpoint: cfg.endpoint,
-          credential: {
-            secretId: cfg.secretId,
-            secretKey: cfg.secretKey,
-          },
-          time: cfg.sendTimeThreshold,
-          count: cfg.sendCountThreshold,
-          onSendLogsError: (result: unknown) => {
-            if (
-              result !== null &&
-              typeof result === "object" &&
-              (result as Record<string, unknown>).status === 200
-            ) {
-              return;
-            }
-            ctx.logger.warn(`diagnostics-cls: Trace 事件上传失败 - ${JSON.stringify(result)}`);
-          },
-        });
-      }
+      traceProducer =
+        cfg.traceTopicId === cfg.topicId
+          ? producer
+          : createProducer(ns, cfg.traceTopicId, cfg, "Trace 事件上传失败", (msg) =>
+              ctx.logger.warn(`diagnostics-cls: ${msg}`),
+            );
 
       // 初始化框架运行日志 producer（若 logTopicId 与主 topicId 不同则创建独立实例）
-      if (cfg.logTopicId === cfg.topicId) {
-        logProducer = producer;
-      } else {
-        const ProducerClsLog = ns.Producer as new (...args: unknown[]) => unknown;
-        logProducer = new ProducerClsLog({
-          topic_id: cfg.logTopicId,
-          endpoint: cfg.endpoint,
-          credential: {
-            secretId: cfg.secretId,
-            secretKey: cfg.secretKey,
-          },
-          time: cfg.sendTimeThreshold,
-          count: cfg.sendCountThreshold,
-          onSendLogsError: (result: unknown) => {
-            if (
-              result !== null &&
-              typeof result === "object" &&
-              (result as Record<string, unknown>).status === 200
-            ) {
-              return;
-            }
-            ctx.logger.warn(`diagnostics-cls: 框架运行日志上传失败 - ${JSON.stringify(result)}`);
-          },
-        });
-      }
+      logProducer =
+        cfg.logTopicId === cfg.topicId
+          ? producer
+          : createProducer(ns, cfg.logTopicId, cfg, "框架运行日志上传失败", (msg) =>
+              ctx.logger.warn(`diagnostics-cls: ${msg}`),
+            );
 
       // 初始化 Metrics producer（若 metricsTopicId 与主 topicId 不同则创建独立实例）
       if (cfg.enableMetrics) {
-        if (cfg.metricsTopicId === cfg.topicId) {
-          metricsProducer = producer;
-        } else {
-          const ProducerCls2 = ns.Producer as new (...args: unknown[]) => unknown;
-          metricsProducer = new ProducerCls2({
-            topic_id: cfg.metricsTopicId,
-            endpoint: cfg.endpoint,
-            credential: {
-              secretId: cfg.secretId,
-              secretKey: cfg.secretKey,
-            },
-            time: cfg.sendTimeThreshold,
-            count: cfg.sendCountThreshold,
-            onSendLogsError: (result: unknown) => {
-              if (
-                result !== null &&
-                typeof result === "object" &&
-                (result as Record<string, unknown>).status === 200
-              ) {
-                return;
-              }
-              ctx.logger.warn(`diagnostics-cls: Metrics 上传失败 - ${JSON.stringify(result)}`);
-            },
-          });
-        }
+        metricsProducer =
+          cfg.metricsTopicId === cfg.topicId
+            ? producer
+            : createProducer(ns, cfg.metricsTopicId, cfg, "Metrics 上传失败", (msg) =>
+                ctx.logger.warn(`diagnostics-cls: ${msg}`),
+              );
       }
 
       // 初始化 Session 日志 producer（若 sessionLogTopicId 与主 topicId 不同则创建独立实例）
       if (cfg.enableSessionLog) {
-        if (cfg.sessionLogTopicId === cfg.topicId) {
-          sessionLogProducer = producer;
-        } else {
-          const ProducerClsSession = ns.Producer as new (...args: unknown[]) => unknown;
-          sessionLogProducer = new ProducerClsSession({
-            topic_id: cfg.sessionLogTopicId,
-            endpoint: cfg.endpoint,
-            credential: {
-              secretId: cfg.secretId,
-              secretKey: cfg.secretKey,
-            },
-            time: cfg.sendTimeThreshold,
-            count: cfg.sendCountThreshold,
-            onSendLogsError: (result: unknown) => {
-              if (
-                result !== null &&
-                typeof result === "object" &&
-                (result as Record<string, unknown>).status === 200
-              ) {
-                return;
-              }
-              ctx.logger.warn(`diagnostics-cls: Session 日志上传失败 - ${JSON.stringify(result)}`);
-            },
-          });
-        }
+        sessionLogProducer =
+          cfg.sessionLogTopicId === cfg.topicId
+            ? producer
+            : createProducer(ns, cfg.sessionLogTopicId, cfg, "Session 日志上传失败", (msg) =>
+                ctx.logger.warn(`diagnostics-cls: ${msg}`),
+              );
       }
 
       // 初始化应用日志 producer（若 appLogTopicId 与主 topicId 不同则创建独立实例）
       if (cfg.enableAppLog) {
-        if (cfg.appLogTopicId === cfg.topicId) {
-          appLogProducer = producer;
-        } else {
-          const ProducerClsApp = ns.Producer as new (...args: unknown[]) => unknown;
-          appLogProducer = new ProducerClsApp({
-            topic_id: cfg.appLogTopicId,
-            endpoint: cfg.endpoint,
-            credential: {
-              secretId: cfg.secretId,
-              secretKey: cfg.secretKey,
-            },
-            time: cfg.sendTimeThreshold,
-            count: cfg.sendCountThreshold,
-            onSendLogsError: (result: unknown) => {
-              if (
-                result !== null &&
-                typeof result === "object" &&
-                (result as Record<string, unknown>).status === 200
-              ) {
-                return;
-              }
-              ctx.logger.warn(`diagnostics-cls: 应用日志上传失败 - ${JSON.stringify(result)}`);
-            },
-          });
-        }
+        appLogProducer =
+          cfg.appLogTopicId === cfg.topicId
+            ? producer
+            : createProducer(ns, cfg.appLogTopicId, cfg, "应用日志上传失败", (msg) =>
+                ctx.logger.warn(`diagnostics-cls: ${msg}`),
+              );
       }
 
       // 初始化对话日志 producer（若 conversationLogTopicId 与主 topicId 不同则创建独立实例）
       if (cfg.enableConversationLog) {
-        if (cfg.conversationLogTopicId === cfg.topicId) {
-          conversationLogProducer = producer;
-        } else {
-          const ProducerCls3 = ns.Producer as new (...args: unknown[]) => unknown;
-          conversationLogProducer = new ProducerCls3({
-            topic_id: cfg.conversationLogTopicId,
-            endpoint: cfg.endpoint,
-            credential: {
-              secretId: cfg.secretId,
-              secretKey: cfg.secretKey,
-            },
-            time: cfg.sendTimeThreshold,
-            count: cfg.sendCountThreshold,
-            onSendLogsError: (result: unknown) => {
-              if (
-                result !== null &&
-                typeof result === "object" &&
-                (result as Record<string, unknown>).status === 200
-              ) {
-                return;
-              }
-              ctx.logger.warn(`diagnostics-cls: 对话日志上传失败 - ${JSON.stringify(result)}`);
-            },
-          });
-        }
+        conversationLogProducer =
+          cfg.conversationLogTopicId === cfg.topicId
+            ? producer
+            : createProducer(ns, cfg.conversationLogTopicId, cfg, "对话日志上传失败", (msg) =>
+                ctx.logger.warn(`diagnostics-cls: ${msg}`),
+              );
       }
 
       ctx.logger.info(
@@ -1349,7 +1299,7 @@ export function createDiagnosticsClsTraceService(
           `metricsTopicId=${cfg.metricsTopicId}，appLogTopicId=${cfg.appLogTopicId}，` +
           `sessionLogTopicId=${cfg.sessionLogTopicId}，conversationLogTopicId=${cfg.conversationLogTopicId}，` +
           `enableTraceEvent=${cfg.enableTraceEvent}，enableLogTransport=${cfg.enableLogTransport}，minLevel=${cfg.minLevel}，` +
-          `enableMetrics=${cfg.enableMetrics}，enableAppLog=${cfg.enableAppLog}（实时流）enableSessionLog=${cfg.enableSessionLog}（实时流）`,
+          `enableMetrics=${cfg.enableMetrics}，enableAppLog=${cfg.enableAppLog}（实时流），enableSessionLog=${cfg.enableSessionLog}（实时流）`,
       );
 
       // enableAppLog：通过 registerLogTransport 实现实时流（零磁盘 I/O，替代文件 tail）
@@ -1393,7 +1343,7 @@ export function createDiagnosticsClsTraceService(
             }
             appLogProducer.send(item).catch((e: unknown) => {
               const msg = e instanceof Error ? e.message : JSON.stringify(e);
-              console.warn(`[diagnostics-cls] app log send 失败: ${msg}`);
+              ctx.logger.warn(`diagnostics-cls: app log send 失败: ${msg}`);
             });
           } catch (err) {
             ctx.logger.error(
@@ -1406,25 +1356,27 @@ export function createDiagnosticsClsTraceService(
       // 订阅诊断事件（Span 可通过 enableTraceEvent: false 关闭，Metrics 可通过 enableMetrics: false 关闭）
       unsubscribe = onDiagnosticEvent((evt: DiagnosticEventPayload) => {
         try {
+          // 在事件入口统一生成时间戳，确保同一事件的所有 Metric 时间戳一致
+          const now = nowIso();
           switch (evt.type) {
             // ── Span 事件 ──────────────────────────────────────────────────────
             case "model.usage":
               if (cfg.enableTraceEvent) sendSpan(buildModelUsageSpan(evt));
               // 补充 tokensCounter / costCounter / durationHistogram / contextHistogram
               if (cfg.enableMetrics) {
-                for (const m of buildModelUsageTokensMetrics(evt)) sendMetric(m);
-                const costMetric = buildModelUsageCostMetric(evt);
+                for (const m of buildModelUsageTokensMetrics(evt, now)) sendMetric(m);
+                const costMetric = buildModelUsageCostMetric(evt, now);
                 if (costMetric) sendMetric(costMetric);
-                const durationMetric2 = buildModelUsageDurationMetric(evt);
+                const durationMetric2 = buildModelUsageDurationMetric(evt, now);
                 if (durationMetric2) sendMetric(durationMetric2);
-                for (const m of buildModelUsageContextMetrics(evt)) sendMetric(m);
+                for (const m of buildModelUsageContextMetrics(evt, now)) sendMetric(m);
               }
               return;
             case "webhook.processed": {
               if (cfg.enableTraceEvent) sendSpan(buildWebhookProcessedSpan(evt));
               // 补充 webhookDurationHistogram
               if (cfg.enableMetrics) {
-                const durationMetric = buildWebhookProcessedDurationMetric(evt);
+                const durationMetric = buildWebhookProcessedDurationMetric(evt, now);
                 if (durationMetric) sendMetric(durationMetric);
               }
               return;
@@ -1435,52 +1387,53 @@ export function createDiagnosticsClsTraceService(
             case "message.processed":
               if (cfg.enableTraceEvent) sendSpan(buildMessageProcessedSpan(evt));
               // 补充 messageProcessedCounter + messageDurationHistogram
-              if (cfg.enableMetrics) sendMetric(buildMessageProcessedMetric(evt));
+              if (cfg.enableMetrics) sendMetric(buildMessageProcessedMetric(evt, now));
               return;
             case "session.stuck":
               if (cfg.enableTraceEvent) sendSpan(buildSessionStuckSpan(evt));
               if (cfg.enableMetrics) {
-                sendMetric(buildSessionStuckMetric(evt));
+                sendMetric(buildSessionStuckMetric(evt, now));
                 // 补充 sessionStuckAgeHistogram
-                sendMetric(buildSessionStuckAgeMetric(evt));
+                sendMetric(buildSessionStuckAgeMetric(evt, now));
               }
               return;
             // ── 纯 Metrics 事件 ────────────────────────────────────────────────
             case "webhook.received":
-              if (cfg.enableMetrics) sendMetric(buildWebhookReceivedMetric(evt));
+              if (cfg.enableMetrics) sendMetric(buildWebhookReceivedMetric(evt, now));
               return;
             case "message.queued":
               if (cfg.enableMetrics) {
-                sendMetric(buildMessageQueuedMetric(evt));
+                sendMetric(buildMessageQueuedMetric(evt, now));
                 // 补充 queueDepthHistogram（message.queued 时）
-                const depthMetric = buildMessageQueuedDepthMetric(evt);
+                const depthMetric = buildMessageQueuedDepthMetric(evt, now);
                 if (depthMetric) sendMetric(depthMetric);
               }
               return;
             case "queue.lane.enqueue":
               if (cfg.enableMetrics) {
-                sendMetric(buildLaneEnqueueMetric(evt));
+                sendMetric(buildLaneEnqueueMetric(evt, now));
                 // 补充 queueDepthHistogram（enqueue 时）
-                sendMetric(buildLaneEnqueueDepthMetric(evt));
+                sendMetric(buildLaneEnqueueDepthMetric(evt, now));
               }
               return;
             case "queue.lane.dequeue":
               if (cfg.enableMetrics) {
-                sendMetric(buildLaneDequeueMetric(evt));
+                sendMetric(buildLaneDequeueMetric(evt, now));
                 // 补充 queueDepthHistogram + queueWaitHistogram（dequeue 时）
-                sendMetric(buildLaneDequeueDepthMetric(evt));
+                sendMetric(buildLaneDequeueDepthMetric(evt, now));
               }
               return;
             case "session.state":
-              if (cfg.enableMetrics) sendMetric(buildSessionStateMetric(evt));
+              if (cfg.enableMetrics) sendMetric(buildSessionStateMetric(evt, now));
               return;
             case "run.attempt":
-              if (cfg.enableMetrics) sendMetric(buildRunAttemptMetric(evt));
+              if (cfg.enableMetrics) sendMetric(buildRunAttemptMetric(evt, now));
               return;
             case "diagnostic.heartbeat":
-              if (cfg.enableMetrics) sendMetric(buildHeartbeatMetric(evt));
+              if (cfg.enableMetrics) sendMetric(buildHeartbeatMetric(evt, now));
               return;
             case "tool.loop":
+              // tool.loop 事件触发频率极高（每次工具调用循环均会触发），无诊断价值，跳过上报
               return;
           }
         } catch (err) {
@@ -1541,7 +1494,7 @@ export function createDiagnosticsClsTraceService(
 
             logProducer.send(item).catch((e: unknown) => {
               const msg = e instanceof Error ? e.message : JSON.stringify(e);
-              console.warn(`[diagnostics-cls] log send 失败: ${msg}`);
+              ctx.logger.warn(`diagnostics-cls: log send 失败: ${msg}`);
             });
           } catch (err) {
             // transport 失败时记录错误日志
@@ -1560,25 +1513,8 @@ export function createDiagnosticsClsTraceService(
       stopTransport = null;
       stopAppLogTransport?.();
       stopAppLogTransport = null;
-      // 各 producer 若与主 producer 不同则单独置空（SDK 无 shutdown 接口，依赖 GC）
-      if (traceProducer !== producer) {
-        traceProducer = null;
-      }
-      if (logProducer !== producer) {
-        logProducer = null;
-      }
-      if (metricsProducer !== producer) {
-        metricsProducer = null;
-      }
-      if (conversationLogProducer !== producer) {
-        conversationLogProducer = null;
-      }
-      if (sessionLogProducer !== producer) {
-        sessionLogProducer = null;
-      }
-      if (appLogProducer !== producer) {
-        appLogProducer = null;
-      }
+      // 统一置空所有 producer 及 serviceCtx（SDK 无 shutdown 接口，依赖 GC 回收）
+      serviceCtx = null;
       producer = null;
       traceProducer = null;
       logProducer = null;
